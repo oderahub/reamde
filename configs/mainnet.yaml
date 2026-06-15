@@ -45,11 +45,12 @@ wallet_approvals:
   mode: max
 
 unattended:
-  # Lowered 1.00 -> 0.05 for the final 800K push (2026-06-13): the mill is
-  # wallet-funded IOC with no resting orders, so draining gas toward empty
-  # carries no stuck-state risk — it just stops submitting when too low. The
-  # 0.05 buffer covers ~15 last tx; below that, attempts simply fail harmless.
-  min_native_somi: "0.05"
+  # Raised back to 1.00 (2026-06-15): the bot parks with a full 1 SOMI in
+  # reserve instead of draining to dust. That 1 SOMI is the key — it's
+  # enough gas to send a buy-SOMI tx, so at the stall we convert USDso ->
+  # SOMI and self-finish to 1M without an org refill (the 0.045-SOMI
+  # bootstrap deadlock is avoided by leaving this buffer).
+  min_native_somi: "1.00"
   # Phase 2 survival mode: drain wallet to ~$1 (min quantity floor)
   # instead of pausing at $1 USDso. The strategy already clamps each
   # buy to 95% of available balance, so removing this floor doesn't
@@ -93,9 +94,13 @@ strategies:
     # Deploy this ONLY when the tank still holds ~1.5-2 SOMI (bootstrap room);
     # at <0.4 SOMI the SOMI buys can't be sent. Costs ~$3 extra retention
     # (18bp SOMI cycles), so 1M lands with ~$3-4 USDso vs ~$7 on org gas.
+    # 2026-06-15 final approach: SOMI removed again. The self-refuel's 18bp
+    # cycles were bleeding ~$0.4/bp extra; with 15.8 SOMI already banked,
+    # WETH-only (2bp) rides cheaply to ~991K. The 1.0 gas floor (below)
+    # leaves enough gas to buy the final ~9K of gas from USDso at the stall
+    # — avoiding the bootstrap trap and the org entirely. Lands ~1M, ~$4 kept.
     markets:
       - WETH:USDso
-      - SOMI:USDso
     cycle_interval_sec: 4.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
