@@ -18,7 +18,10 @@ bot:
   # Lowered to 15 (floor $3) 2026-06-14 for the SOMI-self-refuel finish: the
   # 18bp SOMI cycles burn ~$3 extra, so a $5 floor would halt ~5K short of
   # 1M. Floor $3 lets it reach 1M and stop with ~$3-4 USDso retained.
-  starting_capital_usd: 15.00
+  # 2026-06-16 04:35 — dropped to 5 (floor $1) on the final 1M approach:
+  # at ~$5.6 equity the old $3 floor would kill-switch ~2K short of 1M.
+  # Floor $1 leaves room to cross the milestone (+18.6K) and a bit beyond.
+  starting_capital_usd: 5.00
   markets_to_watch:
     - SOMI:USDso
     - WETH:USDso
