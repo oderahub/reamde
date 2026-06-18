@@ -85,6 +85,40 @@ class TestVolumeMill:
         assert order.price == Decimal("0.5013")
 
     @pytest.mark.asyncio
+    async def test_pauses_buy_below_min_cycle_floor(self):
+        """Efficiency floor: when capital can only fund a sub-min_cycle_usd
+        order, pause (no signal) instead of placing a tiny, gas-wasteful cycle.
+        $8 quote → ~$7.60 target (95%) < $10 floor → skip — even though $7.60 is
+        well above the exchange min-order, so without the floor it would trade."""
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "size_per_cycle_usd": "45.00",
+            "min_cycle_usd": "10.00",
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="8.00", base="0")
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        assert signals == []
+
+    @pytest.mark.asyncio
+    async def test_buys_when_cycle_meets_min_floor(self):
+        """Same floor, ample capital: $50 quote → $45 target ≥ $10 → places."""
+        strat = VolumeMill({
+            "market": "WETH:USDso",
+            "size_per_cycle_usd": "45.00",
+            "min_cycle_usd": "10.00",
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="50.00", base="0")
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        assert len(signals) == 1
+        assert signals[0].order.side == Side.BUY
+
+    @pytest.mark.asyncio
     async def test_emits_sell_when_holding_base(self):
         strat = VolumeMill({"market": "SOMI:USDso", "size_per_cycle_usd": "20.00",
                               "max_inventory_imbalance": "1"})

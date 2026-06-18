@@ -44,6 +44,14 @@ class VolumeMill(TradingStrategy):
         self.size_per_cycle_usd = Decimal(str(
             size_by_market.get(self.market.value, config.get("size_per_cycle_usd", "20.00"))
         ))
+        # Efficiency floor. Order size ≈ 95% of free quote, so as capital bleeds
+        # the cycle shrinks toward the exchange min-order (~$1.80 on WETH), where
+        # gas-per-volume blows up ~10x. The leaderboard proved this: our $/fill
+        # was $13.67 vs the field's $22-35 because thousands of late cycles ran
+        # at the floor, doubling our tx count for the same volume. Below this
+        # threshold we PAUSE the buy (skip, keep cycling once refueled) instead
+        # of placing a tiny, gas-wasteful order. 0 = disabled (drain-to-dust).
+        self.min_cycle_usd = Decimal(str(config.get("min_cycle_usd", "0")))
         self.max_inventory_imbalance = Decimal(str(config.get("max_inventory_imbalance", "0.50")))
         self.max_inventory_imbalance_usd = Decimal(
             str(config.get("max_inventory_imbalance_usd", "0"))
@@ -186,6 +194,15 @@ class VolumeMill(TradingStrategy):
                 "buy_target_zero_after_depth_cap",
                 market=self.market.value,
                 ask_depth_usd=str(ms.ask_depth_usd),
+                free_quote=str(free_quote),
+            )
+            return []
+        if self.min_cycle_usd > 0 and target_usd < self.min_cycle_usd:
+            self._skip(
+                "buy_below_min_cycle",
+                market=self.market.value,
+                target_usd=str(target_usd),
+                min_cycle_usd=str(self.min_cycle_usd),
                 free_quote=str(free_quote),
             )
             return []

@@ -22,11 +22,15 @@ bot:
   # at ~$5.6 equity the old $3 floor would kill-switch ~2K short of 1M.
   # Floor $1 leaves room to cross the milestone (+18.6K) and a bit beyond.
   starting_capital_usd: 5.00
+  # Tier-1 throughput (2026-06-17): watch ONLY the markets we use — WETH (the
+  # sole volume_mill pair) and SOMI (native-gas tracking for the min_native_somi
+  # floor). Dropping USDC.e/WBTC halves every read fan-out (orderbook polls,
+  # vault-balance refresh after each tx, open-order listing) since the engine
+  # loops these per market. Pure waste removal: neither pair is traded. Re-add
+  # a pair here before enabling it in any strategy.
   markets_to_watch:
-    - SOMI:USDso
     - WETH:USDso
-    - USDC.e:USDso
-    - WBTC:USDso
+    - SOMI:USDso
 
 bootstrap:
   enabled: false
@@ -109,6 +113,14 @@ strategies:
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
       SOMI:USDso: "5.00"
+    # Efficiency floor (2026-06-17): pause buys once the cycle would drop below
+    # $10 instead of grinding to the ~$1.80 min-order. Leaderboard post-mortem:
+    # our $/fill was $13.67 vs the field's $22-35 — thousands of sub-$4 late
+    # cycles doubled our tx count (76K vs ~45K) for the SAME volume, burning
+    # ~2x the SOMI. Capital must stay >~$10.5 (order≈95% of free quote) to keep
+    # fills large; when it parks here, refuel USDso to resume. Tune higher for
+    # bigger fills (pauses sooner) or lower to spend more before pausing.
+    min_cycle_usd: "10.00"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
