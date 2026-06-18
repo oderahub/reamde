@@ -34,10 +34,12 @@ bot:
 
 bootstrap:
   enabled: false
+  # NOTE: main.py unions these into markets_to_watch even when bootstrap is
+  # disabled, so list only markets we actually use — otherwise WBTC sneaks back
+  # into the read fan-out the Tier-1 change removed. Kept = WETH + SOMI (gas).
   candidate_markets:
-    - SOMI:USDso
     - WETH:USDso
-    - WBTC:USDso
+    - SOMI:USDso
   min_quote_balance_usd: "5.00"
   target_quote_to_spend_usd: "3.00"
   max_quote_fraction: "0.10"
