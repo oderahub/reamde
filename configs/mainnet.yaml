@@ -22,14 +22,14 @@ bot:
   # at ~$5.6 equity the old $3 floor would kill-switch ~2K short of 1M.
   # Floor $1 leaves room to cross the milestone (+18.6K) and a bit beyond.
   starting_capital_usd: 5.00
-  # Tier-1 throughput (2026-06-17): watch ONLY the markets we use — WETH (the
-  # sole volume_mill pair) and SOMI (native-gas tracking for the min_native_somi
-  # floor). Dropping USDC.e/WBTC halves every read fan-out (orderbook polls,
-  # vault-balance refresh after each tx, open-order listing) since the engine
-  # loops these per market. Pure waste removal: neither pair is traded. Re-add
-  # a pair here before enabling it in any strategy.
+  # Watch only markets we use. WETH + WBTC are milled (both ~2bp spread, each
+  # gated by its OWN momentum trend); SOMI is native-gas tracking for the
+  # min_native_somi floor. USDC.e (stable, banned) stays dropped — the Tier-1
+  # read cut still holds for it. WBTC re-added 2026-06-18 as a second uptrend
+  # venue so the bot routes capital to whichever of WETH/WBTC is actually rising.
   markets_to_watch:
     - WETH:USDso
+    - WBTC:USDso
     - SOMI:USDso
 
 bootstrap:
@@ -39,6 +39,7 @@ bootstrap:
   # into the read fan-out the Tier-1 change removed. Kept = WETH + SOMI (gas).
   candidate_markets:
     - WETH:USDso
+    - WBTC:USDso
     - SOMI:USDso
   min_quote_balance_usd: "5.00"
   target_quote_to_spend_usd: "3.00"
@@ -110,10 +111,12 @@ strategies:
     # — avoiding the bootstrap trap and the org entirely. Lands ~1M, ~$4 kept.
     markets:
       - WETH:USDso
+      - WBTC:USDso
     cycle_interval_sec: 4.0
     size_per_cycle_usd: 2.00
     size_per_cycle_usd_by_market:
       WETH:USDso: "45.00"
+      WBTC:USDso: "45.00"
       SOMI:USDso: "5.00"
     # Efficiency floor (2026-06-17): pause buys once the cycle would drop below
     # $10 instead of grinding to the ~$1.80 min-order. Leaderboard post-mortem:
@@ -130,9 +133,13 @@ strategies:
     # never gated (a held position always flattens). min_change_bps=0 -> trade
     # only when price is flat/rising over the 45s window; raise it positive for
     # strict-uptrend-only (cheaper, less volume), lower it for more volume.
+    # 2026-06-18: set to +3 — skip the flat/weak-bounce zone (0..+3bps) that was
+    # buying failing bounces in a down market; mill only mild-to-strong uptrends.
+    # Applied PER MARKET, so each mill (WETH, WBTC) gates on its own trend and the
+    # bot routes capital to whichever pair is genuinely rising.
     momentum_gate_enabled: true
     momentum_lookback_sec: 45
-    momentum_min_change_bps: "0"
+    momentum_min_change_bps: "3"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0
