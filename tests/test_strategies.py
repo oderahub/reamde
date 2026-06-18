@@ -119,6 +119,59 @@ class TestVolumeMill:
         assert signals[0].order.side == Side.BUY
 
     @pytest.mark.asyncio
+    async def test_momentum_gate_pauses_on_downtrend(self):
+        """A falling WETH trend pauses new buys (no signal) — avoids milling into
+        a downtrend, where adverse selection roughly doubles the USDso burn."""
+        strat = VolumeMill({
+            "market": "WETH:USDso", "size_per_cycle_usd": "20.00",
+            "momentum_gate_enabled": True, "momentum_lookback_sec": 45,
+            "momentum_min_change_bps": "0",
+        })
+        t0 = time.time()
+        strat._mid_history.extend([(t0 - 40, Decimal("1995")), (t0 - 20, Decimal("1988"))])
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")  # mid below history
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="50", base="0")
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        assert signals == []
+        assert strat.last_skip_reason == "buy_paused_downtrend"
+
+    @pytest.mark.asyncio
+    async def test_momentum_gate_allows_uptrend(self):
+        """A rising WETH trend lets the buy cycle proceed."""
+        strat = VolumeMill({
+            "market": "WETH:USDso", "size_per_cycle_usd": "20.00",
+            "momentum_gate_enabled": True, "momentum_lookback_sec": 45,
+            "momentum_min_change_bps": "0",
+        })
+        t0 = time.time()
+        strat._mid_history.extend([(t0 - 40, Decimal("1970")), (t0 - 20, Decimal("1974"))])
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")  # mid above history
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="50", base="0")
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        assert len(signals) == 1
+        assert signals[0].order.side == Side.BUY
+
+    @pytest.mark.asyncio
+    async def test_momentum_gate_trades_without_history(self):
+        """Cold start: gate enabled but no window yet -> trend unknown -> do NOT
+        pause (otherwise the bot would stall forever waiting for history)."""
+        strat = VolumeMill({
+            "market": "WETH:USDso", "size_per_cycle_usd": "20.00",
+            "momentum_gate_enabled": True,
+        })
+        ms = make_market_state(MarketSymbol.WETH_USDSO, "1979.14", "1979.55")
+        inv = make_inventory(MarketSymbol.WETH_USDSO, quote="50", base="0")
+        signals = await strat.generate_signals(
+            {MarketSymbol.WETH_USDSO: ms}, {MarketSymbol.WETH_USDSO: inv},
+        )
+        assert len(signals) == 1
+        assert signals[0].order.side == Side.BUY
+
+    @pytest.mark.asyncio
     async def test_emits_sell_when_holding_base(self):
         strat = VolumeMill({"market": "SOMI:USDso", "size_per_cycle_usd": "20.00",
                               "max_inventory_imbalance": "1"})

@@ -123,6 +123,16 @@ strategies:
     # fills large; when it parks here, refuel USDso to resume. Tune higher for
     # bigger fills (pauses sooner) or lower to spend more before pausing.
     min_cycle_usd: "10.00"
+    # Momentum gate (2026-06-18): only open a buy cycle when WETH's recent trend
+    # is flat-to-up. Milling into a downtrend cost ~12bp (adverse selection) vs
+    # ~6-7bp flat — this halves the USDso bleed for the same (gas-limited) volume,
+    # so the remaining rank-chase volume is much cheaper on capital. Sells are
+    # never gated (a held position always flattens). min_change_bps=0 -> trade
+    # only when price is flat/rising over the 45s window; raise it positive for
+    # strict-uptrend-only (cheaper, less volume), lower it for more volume.
+    momentum_gate_enabled: true
+    momentum_lookback_sec: 45
+    momentum_min_change_bps: "0"
     max_inventory_imbalance_usd: 80.00
     # Only cycle at the 2bp spread floor; skip flickers and one-sided books.
     max_spread_bps: 3.0

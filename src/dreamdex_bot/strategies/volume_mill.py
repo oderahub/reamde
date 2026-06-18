@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections import deque
 from decimal import Decimal
 from typing import Any
 
@@ -81,6 +82,20 @@ class VolumeMill(TradingStrategy):
             )
         ))
 
+        # Momentum gate: only OPEN a new buy cycle when the recent price trend is
+        # flat-to-up. Each round trip pays the spread regardless, but milling
+        # *into a downtrend* adds adverse selection (our sell fills a tick lower
+        # as price slides) — measured ~12bp burn on a falling WETH vs ~6-7bp
+        # flat. Pausing buys on downtrends keeps the USDso bleed down while still
+        # generating ranking volume on flat/up moves. Sells are never gated, so a
+        # mid-cycle position always flattens. min_change_bps = the minimum price
+        # change over the lookback window required to allow a buy (0 = flat-to-up
+        # only; a small negative tolerates noise; positive = strict uptrend).
+        self.momentum_gate_enabled = bool(config.get("momentum_gate_enabled", False))
+        self.momentum_lookback_sec = float(config.get("momentum_lookback_sec", 45.0))
+        self.momentum_min_change_bps = Decimal(str(config.get("momentum_min_change_bps", "0")))
+        self._mid_history: deque[tuple[float, Decimal]] = deque()
+
         self._last_cycle_ts: float = 0
         self._last_action: Side | None = None
         self._entry_price: Decimal | None = None
@@ -103,6 +118,7 @@ class VolumeMill(TradingStrategy):
         if ms.best_bid is None or ms.best_ask is None:
             self._skip("one_sided_or_empty_book", market=self.market.value)
             return []
+        self._record_mid(ms)
         if not self._book_is_tradeable(ms):
             return []
 
@@ -175,8 +191,40 @@ class VolumeMill(TradingStrategy):
             # Otherwise buy didn't actually fill — try buying again
         return self._buy_cycle(ms, free_quote)
 
+    def _record_mid(self, ms: MarketState) -> None:
+        """Sample the mid price into a rolling window for the momentum gate."""
+        if ms.mid is None or ms.mid <= 0:
+            return
+        now = time.time()
+        self._mid_history.append((now, ms.mid))
+        cutoff = now - self.momentum_lookback_sec
+        while self._mid_history and self._mid_history[0][0] < cutoff:
+            self._mid_history.popleft()
+
+    def _trend_bps(self) -> Decimal | None:
+        """Price change (bps) across the lookback window, oldest->newest. Returns
+        None until the window spans at least half the lookback, so we never gate
+        on a single fresh sample right after startup/reconnect."""
+        if len(self._mid_history) < 2:
+            return None
+        oldest_ts, ref = self._mid_history[0]
+        newest_ts, cur = self._mid_history[-1]
+        if ref <= 0 or newest_ts - oldest_ts < self.momentum_lookback_sec * 0.5:
+            return None
+        return (cur - ref) / ref * Decimal(10000)
+
     def _buy_cycle(self, ms: MarketState, free_quote: Decimal) -> list[TradingSignal]:
         assert ms.best_ask is not None
+        if self.momentum_gate_enabled:
+            trend = self._trend_bps()
+            if trend is not None and trend < self.momentum_min_change_bps:
+                self._skip(
+                    "buy_paused_downtrend",
+                    market=self.market.value,
+                    trend_bps=str(round(trend, 2)),
+                    min_change_bps=str(self.momentum_min_change_bps),
+                )
+                return []
         if self.profit_aware_exit_enabled:
             spread_bps = self._spread_bps(ms)
             if spread_bps is not None and spread_bps > self.entry_max_spread_bps:
