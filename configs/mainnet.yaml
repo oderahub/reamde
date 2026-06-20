@@ -125,7 +125,12 @@ strategies:
     # ~2x the SOMI. Capital must stay >~$10.5 (order≈95% of free quote) to keep
     # fills large; when it parks here, refuel USDso to resume. Tune higher for
     # bigger fills (pauses sooner) or lower to spend more before pausing.
-    min_cycle_usd: "10.00"
+    # 2026-06-20: dropped 10 -> 2 to DEFEND 4th. trader-6 woke up and is
+    # climbing; this lets capital fight all the way to the gas limit instead of
+    # parking ~$10 unused. Gas runs out at ~$10 capital anyway, so this unlocks
+    # ~5K more defensive volume at ~no real capital cost. Raise back once the
+    # rank is locked.
+    min_cycle_usd: "2.00"
     # Momentum gate (2026-06-18): only open a buy cycle when WETH's recent trend
     # is flat-to-up. Milling into a downtrend cost ~12bp (adverse selection) vs
     # ~6-7bp flat — this halves the USDso bleed for the same (gas-limited) volume,
