@@ -55,12 +55,13 @@ wallet_approvals:
   mode: max
 
 unattended:
-  # Raised back to 1.00 (2026-06-15): the bot parks with a full 1 SOMI in
-  # reserve instead of draining to dust. That 1 SOMI is the key — it's
-  # enough gas to send a buy-SOMI tx, so at the stall we convert USDso ->
-  # SOMI and self-finish to 1M without an org refill (the 0.045-SOMI
-  # bootstrap deadlock is avoided by leaving this buffer).
-  min_native_somi: "1.00"
+  # 2026-06-20: dropped 1.00 -> 0.10. The 1.00 reserve existed to keep enough
+  # gas to BUY more SOMI at a stall — but USDso->SOMI is now broken on-chain
+  # (placeOrder native-base bug, trader-9's report, verified). So the 1 SOMI
+  # buffer can neither be spent nor used to refuel — it just strands while
+  # defending 4th. Drop to 0.10 to unlock ~0.9 SOMI (~$3,800 volume) of
+  # defensive runway; 0.10 still leaves room to flatten the final cycle.
+  min_native_somi: "0.10"
   # Phase 2 survival mode: drain wallet to ~$1 (min quantity floor)
   # instead of pausing at $1 USDso. The strategy already clamps each
   # buy to 95% of available balance, so removing this floor doesn't
