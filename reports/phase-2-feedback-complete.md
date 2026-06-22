@@ -461,8 +461,11 @@ were unsupported. We verified their three cited transactions did revert
 on-chain — then ran the identical call shape (`isBid=true`,
 `msg.value=0`, ERC-20 quote as input) from our own wallet and it
 **succeeded** (`status=1`, tx
-`bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca`). The
-only difference was the broadcast gas limit. Our clients never hard-cap
+`bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca`) with
+a **broadcast gas limit of 8,622,412 and only 449,225 gas actually
+used** — which both clears the ≥5M guard and independently corroborates
+the team's note that the forwarded headroom is mostly unused. The only
+difference from the reverting client was that gas limit. Our clients never hard-cap
 it below the guard: the engine sizes gas at `eth_estimateGas × 1.25` and
 falls back to **8,000,000** on estimate failure
 (`core/engine.py:_gas_limit_for_prepared_tx`), and the gas-buy tool
@@ -713,7 +716,8 @@ WS snapshot staleness at subscribe (Finding 9, from structured logs)
 
 Native-SOMI BUY gas-limit guard (Finding 5 addendum 2)
   selector:          0x782b2567 = InsufficientGasForPayout(uint256 gasLeft)
-  our buy tx:        bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca  status=1 (SOMI bought with USDso, >=5M gas)
+  our buy tx:        bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca  status=1
+                     gas limit 8,622,412  |  gasUsed 449,225  (limit clears >=5M guard; used << limit, per team note)
   reverting client:  hard-coded 3,000,000 gas limit
   team confirmation: needs ~>=5,000,000 gas; native-base BUY supported, fix is client-side (raise + sim at same limit)
 ```
