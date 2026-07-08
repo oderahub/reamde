@@ -142,9 +142,12 @@ class VolumeBot7702:
 
     def emit(self, event: str, **kw) -> None:
         rec = {"ts": round(time.time(), 3), "event": event, **kw}
-        self._log.write(json.dumps(rec) + "\n")
+        line = json.dumps(rec)
+        self._log.write(line + "\n")
         self._log.flush()
-        print(json.dumps(rec))
+        # flush=True so logs stream to Render immediately — Python block-buffers
+        # stdout when it isn't a TTY, which otherwise hides output for minutes.
+        print(line, flush=True)
 
     def pick_venue(self, free: float) -> tuple[Pool, float, float, float] | None:
         """Cheapest AFFORDABLE venue: the tightest two-sided book (within

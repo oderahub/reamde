@@ -17,6 +17,9 @@ services:
     autoDeployTrigger: off
     maxShutdownDelaySeconds: 120
     envVars:
+      # Stream logs immediately (Python block-buffers stdout off a TTY).
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: NETWORK
         value: mainnet
       - key: IMPL_ADDRESS
