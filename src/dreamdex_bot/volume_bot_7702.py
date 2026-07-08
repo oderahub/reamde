@@ -55,8 +55,7 @@ class Settings:
     # capital-bound (~$135), not depth-bound.
     max_clip_usdso: float = 500.0
     balance_fraction: float = 0.90     # fraction of free USDso a clip may use
-    depth_cap_bps: float = 10.0        # measure book depth within this band...
-    depth_fraction: float = 0.50       # ...and never clip more than this share of it
+    depth_fraction: float = 0.50       # never clip more than this share of the depth fillable at our cross limit
     cross_bps: float = 5.0             # cross each touch by this much so both legs fill
     # STRICT SPREAD GATE (the "only trade when cheap" rule). Spread IS our cost, so
     # skip any book wider than this — no momentum/trend gate (atomic round-trip =
@@ -76,8 +75,12 @@ class Settings:
     # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
     # spread it across the competition instead of blowing it in ~14h: after each
     # round-trip, wait proportionally so realized volume ≈ this per-day rate.
-    # ~$120k/day ≈ the full burn over ~14 days; tune to how hard rivals push.
-    target_daily_volume_usdso: float = 120_000.0
+    # Front-loaded: ~$300k/day reaches our ~$1.2-1.35M capital-bound ceiling in
+    # ~4-5 days, which overtakes rivals early and de-risks an early cancel (rule
+    # 10 pays on volume-to-date). Pace doesn't change the final total (capital-
+    # bound), only when we bank it. Still ~1 round-trip/40s on deep WBTC. Tune up
+    # (e.g. 500k) to reach the ceiling sooner, down to spread it out.
+    target_daily_volume_usdso: float = 300_000.0
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
     max_round_trips: int = 10_000_000
@@ -124,21 +127,27 @@ class VolumeBot7702:
     def native_gas(self) -> float:
         return from_raw(self.ctx.w3.eth.get_balance(self.ctx.address), 18)
 
-    def min_depth_usd(self, pool: Pool, mid: float, bps: float) -> float:
-        """USDso available within `bps` of mid on the tighter of the two sides — a
-        round-trip crosses both, so the smaller side bounds how big a clip stays
-        cheap (avoids walking the book)."""
-        out = []
-        for is_bid in (False, True):  # ask side (we buy), bid side (we sell)
-            lim = mid * (1 + bps / 10_000) if not is_bid else mid * (1 - bps / 10_000)
-            tot = 0.0
-            for price_raw, size_raw in read_book_levels(pool._contract, is_bid, 15):
-                price = from_raw(price_raw, pool.quote_decimals)
-                size = from_raw(size_raw, pool.base_decimals)
-                if (not is_bid and price <= lim) or (is_bid and price >= lim):
-                    tot += price * size
-            out.append(tot)
-        return min(out)
+    def fillable_usd(self, pool: Pool, best_bid: float, best_ask: float, cross_bps: float) -> float:
+        """USDso we can actually FILL on each side at our cross limit: the buy
+        reaches asks up to best_ask*(1+cross); the sell reaches bids down to
+        best_bid*(1-cross). A round-trip needs both, so the SMALLER side bounds a
+        clip that closes with no residual inventory. This is per-pair and per-
+        moment — a thin book (WETH) self-limits to a small clip, a deep one (WBTC)
+        is bounded only by capital. Measuring at the cross limit (not a loose fixed
+        band) is the fix for the leftover-WETH accumulation."""
+        buy_limit = best_ask * (1 + cross_bps / 10_000)
+        sell_limit = best_bid * (1 - cross_bps / 10_000)
+        ask_usd = 0.0
+        for price_raw, size_raw in read_book_levels(pool._contract, False, 15):  # asks (we buy)
+            price = from_raw(price_raw, pool.quote_decimals)
+            if price <= buy_limit:
+                ask_usd += price * from_raw(size_raw, pool.base_decimals)
+        bid_usd = 0.0
+        for price_raw, size_raw in read_book_levels(pool._contract, True, 15):  # bids (we sell)
+            price = from_raw(price_raw, pool.quote_decimals)
+            if price >= sell_limit:
+                bid_usd += price * from_raw(size_raw, pool.base_decimals)
+        return min(ask_usd, bid_usd)
 
     def emit(self, event: str, **kw) -> None:
         rec = {"ts": round(time.time(), 3), "event": event, **kw}
@@ -167,9 +176,10 @@ class VolumeBot7702:
             spread_bps = (tob.best_ask - tob.best_bid) / tob.mid * 10_000
             if spread_bps > self.cfg.max_spread_bps:
                 continue  # strict spread gate: only trade when it's cheap
-            # Clip = as much capital as we can, capped by book depth so we don't
-            # walk the book (which would turn a 1.3bp spread into real slippage).
-            depth_cap = self.min_depth_usd(p, tob.mid, self.cfg.depth_cap_bps) * self.cfg.depth_fraction
+            # Clip = as much capital as we can, capped by the depth we can actually
+            # fill at our cross limit — so the round-trip closes flat (no leftover
+            # inventory) instead of walking a thin book.
+            depth_cap = self.fillable_usd(p, tob.best_bid, tob.best_ask, self.cfg.cross_bps) * self.cfg.depth_fraction
             clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             min_notional = p.min_qty * tob.best_ask
             if clip < min_notional:
@@ -183,6 +193,8 @@ class VolumeBot7702:
         self.emit("start", network=self.ctx.net.name, wallet=self.ctx.address,
                   impl=self.impl, broadcast=self.broadcast, gas=self.native_gas(),
                   settings=asdict(self.cfg))
+        if self.broadcast:
+            self._flatten_residual_base()  # start flat — clear any stranded inventory
         deadline = self.stats.started + self.cfg.max_minutes * 60
         while time.time() < deadline and self.stats.round_trips < self.cfg.max_round_trips:
             vol_before = self.stats.volume_usdso
@@ -286,6 +298,36 @@ class VolumeBot7702:
             self.emit("gas_topup", somi_qty=round(somi_qty, 4), gas_used=res.gas_used, tx=res.tx_hash)
         except Exception as e:
             self.emit("gas_topup_failed", error=str(e)[:200])
+
+    def _flatten_residual_base(self) -> None:
+        """Sell any leftover base inventory (IOC) so we start flat. Depth-sized
+        clips shouldn't leave residue, but this clears anything from before and is
+        a safety net after restarts. Uses the loop's own NonceManager, so it can't
+        collide with round-trip nonces. Skips dust (< ~$1)."""
+        for sym in CANDIDATE_SYMBOLS:
+            try:
+                p = self._pool(sym)
+                base = p.wallet_base()
+                tob = p.top_of_book()
+                if tob.best_bid is None or base * tob.best_bid < 1.0:
+                    continue
+                price_raw = align_to_tick(
+                    to_raw(tob.best_bid * (1 - self.cfg.cross_bps / 10_000), p.quote_decimals),
+                    p.params.tick_size, "bid",
+                )
+                qty_raw = align_to_lot(to_raw(base, p.base_decimals), p.params.lot_size)
+                if qty_raw < p.params.min_quantity:
+                    continue
+                res = place_order(self.ctx, self.nm, PlaceParams(
+                    pool=p.address, base_is_native=p.base_is_native, is_bid=False,
+                    price_raw=price_raw, quantity_raw=qty_raw, tick_raw=p.params.tick_size,
+                    lot_raw=p.params.lot_size, min_qty_raw=p.params.min_quantity,
+                    expire_ns=build_expire_ns(5 * 60_000), order_type=OrderType.IOC,
+                ))
+                self.emit("flatten_residual", symbol=sym, base=round(base, 8),
+                          usd=round(base * tob.best_bid, 2), tx=res.tx_hash)
+            except Exception as e:
+                self.emit("flatten_failed", symbol=sym, error=str(e)[:200])
 
     def _maybe_keepalive(self) -> None:
         idle_h = (time.time() - self.stats.last_fill_ts) / 3600
