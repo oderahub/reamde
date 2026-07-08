@@ -32,8 +32,11 @@ from pathlib import Path
 from web3 import Web3
 
 from dreamdex_core import Pool, create_chain_context, from_raw
-from dreamdex_core.contract import ERC20_ABI
+from dreamdex_core.contract import ERC20_ABI, read_book_levels
+from dreamdex_core.execute import PlaceParams, place_order
+from dreamdex_core.gotchas import OrderType, build_expire_ns
 from dreamdex_core.nonce import NonceManager
+from dreamdex_core.quant import align_to_lot, align_to_tick, to_raw
 
 from dreamdex_bot.execution import round_trip_7702 as rt
 from dreamdex_bot.execution.deploy_7702 import deploy_impl
@@ -45,12 +48,29 @@ CANDIDATE_SYMBOLS = ["WBTC:USDso", "WETH:USDso"]
 
 @dataclass
 class Settings:
-    max_clip_usdso: float = 40.0       # cap per round-trip so we don't walk the book
+    # Sizing. Gas is the real cap (~4.1k round-trips per 50 SOMI on mainnet), so
+    # each round-trip should be as LARGE as capital + book depth allow — more
+    # volume per gas-tx. max_clip is a high ceiling; capital and live depth are the
+    # true limits. WBTC's book is deep (~$40k within 10bp), so on $150 a clip is
+    # capital-bound (~$135), not depth-bound.
+    max_clip_usdso: float = 500.0
     balance_fraction: float = 0.90     # fraction of free USDso a clip may use
+    depth_cap_bps: float = 10.0        # measure book depth within this band...
+    depth_fraction: float = 0.50       # ...and never clip more than this share of it
     cross_bps: float = 5.0             # cross each touch by this much so both legs fill
-    max_spread_bps: float = 30.0       # skip a venue whose book is wider than this
+    # STRICT SPREAD GATE (the "only trade when cheap" rule). Spread IS our cost, so
+    # skip any book wider than this — no momentum/trend gate (atomic round-trip =
+    # flat inventory, so trend is irrelevant). WBTC ~1.3bp, WETH ~2-5bp normally.
+    max_spread_bps: float = 8.0
     cycle_interval_sec: float = 3.0
-    gas_reserve_native: float = 2.0    # halt below this much SOMI/STT
+    gas_reserve_native: float = 2.0    # hard halt below this much SOMI/STT
+    # Auto gas top-up: when native gas dips below the trigger (but above the hard
+    # reserve), spend a little USDso on SOMI to keep trading. Rule 6 allows this and
+    # it's cheap (~$6/50 SOMI) relative to the volume it unlocks. Mainnet-relevant;
+    # dormant on testnet (native there is STT, and the reserve is ample).
+    gas_topup_enabled: bool = True
+    gas_topup_trigger_native: float = 6.0
+    gas_topup_spend_usdso: float = 3.0
     keepalive_hours: float = 20.0      # force a min trade if idle longer than this
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
@@ -98,6 +118,22 @@ class VolumeBot7702:
     def native_gas(self) -> float:
         return from_raw(self.ctx.w3.eth.get_balance(self.ctx.address), 18)
 
+    def min_depth_usd(self, pool: Pool, mid: float, bps: float) -> float:
+        """USDso available within `bps` of mid on the tighter of the two sides — a
+        round-trip crosses both, so the smaller side bounds how big a clip stays
+        cheap (avoids walking the book)."""
+        out = []
+        for is_bid in (False, True):  # ask side (we buy), bid side (we sell)
+            lim = mid * (1 + bps / 10_000) if not is_bid else mid * (1 - bps / 10_000)
+            tot = 0.0
+            for price_raw, size_raw in read_book_levels(pool._contract, is_bid, 15):
+                price = from_raw(price_raw, pool.quote_decimals)
+                size = from_raw(size_raw, pool.base_decimals)
+                if (not is_bid and price <= lim) or (is_bid and price >= lim):
+                    tot += price * size
+            out.append(tot)
+        return min(out)
+
     def emit(self, event: str, **kw) -> None:
         rec = {"ts": round(time.time(), 3), "event": event, **kw}
         self._log.write(json.dumps(rec) + "\n")
@@ -121,11 +157,14 @@ class VolumeBot7702:
                 continue
             spread_bps = (tob.best_ask - tob.best_bid) / tob.mid * 10_000
             if spread_bps > self.cfg.max_spread_bps:
-                continue
-            clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction)
+                continue  # strict spread gate: only trade when it's cheap
+            # Clip = as much capital as we can, capped by book depth so we don't
+            # walk the book (which would turn a 1.3bp spread into real slippage).
+            depth_cap = self.min_depth_usd(p, tob.mid, self.cfg.depth_cap_bps) * self.cfg.depth_fraction
+            clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             min_notional = p.min_qty * tob.best_ask
             if clip < min_notional:
-                continue  # can't meet this pair's minimum with current capital
+                continue  # can't meet this pair's minimum with current capital/depth
             if best is None or spread_bps < best[1]:
                 best = (p, spread_bps, clip, min_notional)
         return best
@@ -147,12 +186,15 @@ class VolumeBot7702:
         self.emit("stop", **self._summary())
 
     def _tick(self) -> None:
-        # 1. Gas guard.
+        # 1. Gas guard, then auto top-up if dipping (buys more runway with a little
+        #    USDso — rule 6 allows it and it's cheap vs the volume it unlocks).
         gas = self.native_gas()
         if gas < self.cfg.gas_reserve_native:
             self.emit("halt_low_gas", gas=gas, reserve=self.cfg.gas_reserve_native)
             time.sleep(10)
             return
+        if self.cfg.gas_topup_enabled and self.broadcast and gas < self.cfg.gas_topup_trigger_native:
+            self._topup_gas()
 
         # 2. Burn-to-floor sizing: pick the cheapest venue we can afford, and use
         #    most of the (near-flat) capital on it. USDso is the shared quote.
@@ -195,6 +237,35 @@ class VolumeBot7702:
             self.emit("round_trip_bad", symbol=pool.symbol, status=res.status,
                       logs=res.logs, tx=res.tx_hash)
 
+    def _topup_gas(self) -> None:
+        """Buy ~gas_topup_spend_usdso of native SOMI via a SOMI:USDso IOC. Uses the
+        loop's own NonceManager (not a fresh Pool nonce manager) so it can't collide
+        with round-trip nonces. Native-base buy → place_order applies the >=5M gas
+        floor automatically."""
+        try:
+            p = Pool.load(self.ctx, "SOMI:USDso")
+            tob = p.top_of_book()
+            if tob.best_ask is None:
+                self.emit("gas_topup_skip", reason="no_ask")
+                return
+            somi_qty = self.cfg.gas_topup_spend_usdso / tob.best_ask
+            price_raw = align_to_tick(
+                to_raw(tob.best_ask * 1.01, p.quote_decimals), p.params.tick_size, "ask"
+            )
+            qty_raw = align_to_lot(to_raw(somi_qty, p.base_decimals), p.params.lot_size)
+            if qty_raw < p.params.min_quantity:
+                self.emit("gas_topup_skip", reason="below_min", somi_qty=somi_qty)
+                return
+            res = place_order(self.ctx, self.nm, PlaceParams(
+                pool=p.address, base_is_native=True, is_bid=True,
+                price_raw=price_raw, quantity_raw=qty_raw, tick_raw=p.params.tick_size,
+                lot_raw=p.params.lot_size, min_qty_raw=p.params.min_quantity,
+                expire_ns=build_expire_ns(5 * 60_000), order_type=OrderType.IOC,
+            ))
+            self.emit("gas_topup", somi_qty=round(somi_qty, 4), gas_used=res.gas_used, tx=res.tx_hash)
+        except Exception as e:
+            self.emit("gas_topup_failed", error=str(e)[:200])
+
     def _maybe_keepalive(self) -> None:
         idle_h = (time.time() - self.stats.last_fill_ts) / 3600
         if idle_h >= self.cfg.keepalive_hours:
@@ -215,8 +286,8 @@ class VolumeBot7702:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=10.0)
-    ap.add_argument("--max-clip-usdso", type=float, default=40.0)
-    ap.add_argument("--cross-bps", type=float, default=5.0)
+    ap.add_argument("--max-clip-usdso", type=float, default=Settings.max_clip_usdso)
+    ap.add_argument("--cross-bps", type=float, default=Settings.cross_bps)
     ap.add_argument("--cycle-sec", type=float, default=3.0)
     ap.add_argument("--broadcast", action="store_true")
     args = ap.parse_args()
