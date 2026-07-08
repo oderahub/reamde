@@ -16,17 +16,22 @@ dependencies = [
     "structlog>=24.0",
     "pyyaml>=6.0",
     "rich>=13.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
+# One-time contract compile/deploy for the EIP-7702 round-trip impl.
+deploy = ["py-solc-x>=2.0"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dreamdex_bot"]
+# dreamdex_core is the protocol team's MIT-licensed Python core (bot-kit),
+# vendored so the 7702 execution path imports it without a sys.path hack.
+packages = ["src/dreamdex_bot", "src/dreamdex_core"]
 
 [tool.ruff]
 line-length = 100
