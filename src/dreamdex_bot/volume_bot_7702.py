@@ -71,6 +71,11 @@ class Settings:
     gas_topup_trigger_native: float = 6.0
     gas_topup_spend_usdso: float = 3.0
     keepalive_hours: float = 20.0      # force a min trade if idle longer than this
+    # Flatten price protection: when selling leftover base, floor the sell at
+    # mid*(1-this) so we never dump into a thin/dislocated book. It still fills at
+    # the real bid normally; if the bid is below the floor, we DON'T sell (keep the
+    # inventory and retry) rather than realize a bad print.
+    max_flatten_slippage_bps: float = 20.0
     # Pacing: total volume is capital-bound (~$1.7M at 0.88bp on $150), so speed
     # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
     # spread it across the competition instead of blowing it in ~14h: after each
@@ -300,21 +305,28 @@ class VolumeBot7702:
             self.emit("gas_topup_failed", error=str(e)[:200])
 
     def _flatten_residual_base(self) -> None:
-        """Sell any leftover base inventory (IOC) so we start flat. Depth-sized
-        clips shouldn't leave residue, but this clears anything from before and is
-        a safety net after restarts. Uses the loop's own NonceManager, so it can't
-        collide with round-trip nonces. Skips dust (< ~$1)."""
+        """Sell any leftover base inventory (IOC) so we start flat — but NEVER at a
+        bad price. The sell limit is floored at mid*(1-max_flatten_slippage_bps):
+        it fills at the real bid in a healthy book, and if the bid has dropped below
+        that floor (thin/dislocated book) we defer rather than dump — keeping the
+        inventory to retry on a later boot/tick. Uses the loop's own NonceManager so
+        it can't collide with round-trip nonces. Skips dust (< ~$1)."""
         for sym in CANDIDATE_SYMBOLS:
             try:
                 p = self._pool(sym)
                 base = p.wallet_base()
                 tob = p.top_of_book()
-                if tob.best_bid is None or base * tob.best_bid < 1.0:
+                if tob.best_bid is None or tob.mid is None or base * tob.best_bid < 1.0:
                     continue
-                price_raw = align_to_tick(
-                    to_raw(tob.best_bid * (1 - self.cfg.cross_bps / 10_000), p.quote_decimals),
-                    p.params.tick_size, "bid",
-                )
+                floor = tob.mid * (1 - self.cfg.max_flatten_slippage_bps / 10_000)
+                if tob.best_bid < floor:
+                    self.emit("flatten_deferred", symbol=sym, reason="bid_below_floor",
+                              bid=round(tob.best_bid, 4), mid=round(tob.mid, 4),
+                              floor=round(floor, 4), base=round(base, 8))
+                    continue
+                # Limit = the floor; the IOC still fills at the (higher) bid, but
+                # can't sell below the floor even if it had to walk the book.
+                price_raw = align_to_tick(to_raw(floor, p.quote_decimals), p.params.tick_size, "bid")
                 qty_raw = align_to_lot(to_raw(base, p.base_decimals), p.params.lot_size)
                 if qty_raw < p.params.min_quantity:
                     continue
@@ -325,7 +337,7 @@ class VolumeBot7702:
                     expire_ns=build_expire_ns(5 * 60_000), order_type=OrderType.IOC,
                 ))
                 self.emit("flatten_residual", symbol=sym, base=round(base, 8),
-                          usd=round(base * tob.best_bid, 2), tx=res.tx_hash)
+                          usd=round(base * tob.best_bid, 2), floor=round(floor, 4), tx=res.tx_hash)
             except Exception as e:
                 self.emit("flatten_failed", symbol=sym, error=str(e)[:200])
 
