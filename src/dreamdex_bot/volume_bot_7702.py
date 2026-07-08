@@ -72,9 +72,15 @@ class Settings:
     gas_topup_trigger_native: float = 6.0
     gas_topup_spend_usdso: float = 3.0
     keepalive_hours: float = 20.0      # force a min trade if idle longer than this
+    # Pacing: total volume is capital-bound (~$1.7M at 0.88bp on $150), so speed
+    # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
+    # spread it across the competition instead of blowing it in ~14h: after each
+    # round-trip, wait proportionally so realized volume ≈ this per-day rate.
+    # ~$120k/day ≈ the full burn over ~14 days; tune to how hard rivals push.
+    target_daily_volume_usdso: float = 120_000.0
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
-    max_round_trips: int = 100_000
+    max_round_trips: int = 10_000_000
 
 
 @dataclass
@@ -176,14 +182,26 @@ class VolumeBot7702:
                   settings=asdict(self.cfg))
         deadline = self.stats.started + self.cfg.max_minutes * 60
         while time.time() < deadline and self.stats.round_trips < self.cfg.max_round_trips:
+            vol_before = self.stats.volume_usdso
             try:
                 self._tick()
             except Exception as e:  # never let one bad cycle kill a 14-day run
                 self.emit("tick_error", error=str(e)[:200])
                 self.nm.reset()
                 time.sleep(2.0)
-            time.sleep(self.cfg.cycle_interval_sec)
+            self._pace_sleep(self.stats.volume_usdso - vol_before)
         self.emit("stop", **self._summary())
+
+    def _pace_sleep(self, traded_volume: float) -> None:
+        """Spread realized volume across the day at ~target_daily_volume. After a
+        round-trip of `traded_volume`, wait proportionally; a skip (0) just waits
+        the base cycle interval before re-checking the book."""
+        base = self.cfg.cycle_interval_sec
+        if traded_volume <= 0 or self.cfg.target_daily_volume_usdso <= 0:
+            time.sleep(base)
+            return
+        pace = traded_volume / self.cfg.target_daily_volume_usdso * 86_400.0
+        time.sleep(max(base, pace))
 
     def _tick(self) -> None:
         # 1. Gas guard, then auto top-up if dipping (buys more runway with a little
@@ -285,18 +303,24 @@ class VolumeBot7702:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    # Runtime: prefer --days for the real competition run; --minutes for short tests.
+    ap.add_argument("--days", type=float, default=None, help="run length in days (overrides --minutes)")
     ap.add_argument("--minutes", type=float, default=10.0)
     ap.add_argument("--max-clip-usdso", type=float, default=Settings.max_clip_usdso)
     ap.add_argument("--cross-bps", type=float, default=Settings.cross_bps)
     ap.add_argument("--cycle-sec", type=float, default=3.0)
+    ap.add_argument("--target-daily", type=float, default=Settings.target_daily_volume_usdso,
+                    help="paced volume/day (USDso); 0 = trade as fast as possible")
     ap.add_argument("--broadcast", action="store_true")
     args = ap.parse_args()
 
+    minutes = args.days * 1440 if args.days is not None else args.minutes
     ctx = create_chain_context()
     nm = NonceManager(ctx.w3, ctx.address)
     cfg = Settings(
-        max_minutes=args.minutes, max_clip_usdso=args.max_clip_usdso,
+        max_minutes=minutes, max_clip_usdso=args.max_clip_usdso,
         cross_bps=args.cross_bps, cycle_interval_sec=args.cycle_sec,
+        target_daily_volume_usdso=args.target_daily,
     )
 
     impl = os.environ.get("IMPL_ADDRESS")

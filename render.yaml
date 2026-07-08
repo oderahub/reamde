@@ -1,3 +1,11 @@
+# Render blueprint for the Dev Traders Program 24/7 volume worker.
+# Runs the EIP-7702 atomic round-trip bot, paced to spread the ~$1.7M capital-
+# bound volume ceiling across the 14-day competition (burn-to-floor, gas top-up
+# on). Restart-safe by design: the loop reads balances fresh each tick and only
+# ever holds flat inventory, so a crash/redeploy mid-run resumes cleanly.
+#
+# Secrets to set in the Render dashboard (sync:false): PRIVATE_KEY.
+# IMPL_ADDRESS is the one-time-deployed mainnet round-trip contract (public).
 services:
   - type: worker
     name: dreamdex-volume-worker
@@ -5,13 +13,14 @@ services:
     plan: starter
     numInstances: 1
     buildCommand: pip install -e .
-    startCommand: python -m bots.main --config configs/mainnet.yaml
+    startCommand: python -m dreamdex_bot.volume_bot_7702 --days 15 --broadcast
     autoDeployTrigger: off
     maxShutdownDelaySeconds: 120
     envVars:
       - key: NETWORK
         value: mainnet
-      - key: WALLET_ADDRESS
-        sync: false
+      - key: IMPL_ADDRESS
+        value: "0x91199efaF4d2504a5CA75f9fA5fE7d4e916F73D2"
+      # Competition wallet key — set in the dashboard, never commit.
       - key: PRIVATE_KEY
         sync: false
