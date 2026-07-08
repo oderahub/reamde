@@ -1,4 +1,4 @@
-# dreamdex-bot
+<!-- # dreamdex-bot
 
 Trading and QA bot for the DreamDEX alpha competition on Somnia.
 
@@ -96,4 +96,4 @@ src/dreamdex_bot/
 └── utils/
     ├── logger.py       # Structured JSONL logging
     └── markets.py      # Tick/lot rounding helpers
-```
+``` -->
