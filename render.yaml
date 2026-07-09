@@ -13,7 +13,7 @@ services:
     plan: starter
     numInstances: 1
     buildCommand: pip install -e .
-    startCommand: python -m dreamdex_bot.volume_bot_7702 --days 15 --broadcast
+    startCommand: python -m dreamdex_bot.volume_bot_7702 --days 15 --broadcast --target-daily 55000 --cross-bps 3 --max-spread-bps 3.0
     autoDeployTrigger: off
     maxShutdownDelaySeconds: 120
     envVars:

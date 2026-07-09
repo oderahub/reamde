@@ -36,10 +36,13 @@ In priority order, by what a new cohort would benefit from most:
 4. **Yield payout cadence** (Finding 4) — decision-blocking for
    competition contexts.
 5. **Custom error selector list** (Finding 5 + addenda) — accelerates
-   revert debugging; we have now reverse-engineered three selectors,
-   including `0x782b2567` (`InsufficientGasForPayout`), which silently
-   disables the native-SOMI buy path for any client that under-sets its
-   gas limit (cost at least one cohort member a working SOMI strategy).
+   revert debugging. We decoded two selectors ourselves (`0xcf479181`,
+   `0xe450d38c`). A third, `0x782b2567` (`InsufficientGasForPayout`), has
+   its ≥5M-gas requirement and error name already documented on the
+   contract-specifications page — but with no published hex→error
+   mapping, a client that hits the bare revert (as one cohort member did)
+   can't reach that page from the failure. The remaining ask: a
+   hex-selector → error table.
 6. **Maker BBO competitiveness disclaimer** (Finding 6) — calibrates
    participant expectations.
 7. **Locked-collateral visibility** (Finding 8) — without it, every
@@ -446,53 +449,6 @@ session that a published selector table would have avoided.
 
 ---
 
-## Finding 5 addendum 2 — third selector `0x782b2567` (`InsufficientGasForPayout`), the highest-impact one
-
-The most operationally severe selector we encountered gates the
-native-SOMI BUY payout path on `SOMI:USDso`:
-
-```text
-selector: 0x782b2567  →  InsufficientGasForPayout(uint256 gasLeft)
-```
-
-**What we observed.** Another cohort member reported `placeOrder` on
-`SOMI:USDso` reverting with this selector and concluded native-base buys
-were unsupported. We verified their three cited transactions did revert
-on-chain — then ran the identical call shape (`isBid=true`,
-`msg.value=0`, ERC-20 quote as input) from our own wallet and it
-**succeeded** (`status=1`, tx
-`bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca`) with
-a **broadcast gas limit of 8,622,412 and only 449,225 gas actually
-used** — which both clears the ≥5M guard and independently corroborates
-the team's note that the forwarded headroom is mostly unused. The only
-difference from the reverting client was that gas limit. Our clients never hard-cap
-it below the guard: the engine sizes gas at `eth_estimateGas × 1.25` and
-falls back to **8,000,000** on estimate failure
-(`core/engine.py:_gas_limit_for_prepared_tx`), and the gas-buy tool
-honors the server-prepared gas limit (`tools/buy_somi_gas.py`). The
-reverting client hard-coded a `3,000,000` limit.
-
-**Confirmed by the protocol team.** The team subsequently confirmed
-`0x782b2567 = InsufficientGasForPayout(uint256 gasLeft)` — a deliberate
-guard on the native-SOMI payout path that needs roughly **≥5,000,000
-gas** to clear under Somnia's gas model. Native-base BUY is fully
-supported and the call shape above is correct; the only requirement is
-the gas limit. The fix is client-side: raise the broadcast gas limit to
-≥5M **and simulate at the same limit** — a simulation run at a lower
-limit passes while the broadcast reverts, which is exactly how this
-failure hides from a client that sim-gates its orders.
-
-**Why this belongs in the report.** This is the third selector (after
-`0xcf479181` and `0xe450d38c`) we had to reverse-engineer from behavior,
-and the highest-impact: it silently disables an entire order path, its
-revert is indistinguishable from "feature unsupported" without the
-decode, and it cost at least one cohort member a working SOMI strategy.
-A published selector table (Finding 5's suggested fix) plus a one-line
-note on the native-payout gas floor in `trading/common/order-types.md`
-would have prevented the misdiagnosis entirely.
-
----
-
 ## Finding 12 — Vault balance endpoint is not scoped to the authenticated wallet
 
 **What we observed.** `GET /v0/markets/{symbol}/vault/balance` requires
@@ -713,13 +669,6 @@ WS snapshot staleness at subscribe (Finding 9, from structured logs)
   06:59:25.465   ws.connected
   06:59:25.658   ws_book_stale_replaced  USDC.e:USDso  drift_bps=15.0000
   06:59:25.770   ws_book_stale_replaced  WBTC:USDso    drift_bps=15.0061
-
-Native-SOMI BUY gas-limit guard (Finding 5 addendum 2)
-  selector:          0x782b2567 = InsufficientGasForPayout(uint256 gasLeft)
-  our buy tx:        bce80ca51a24e1541a72901e1701edc537324f1f9365bcfa1e9b26d3edff60ca  status=1
-                     gas limit 8,622,412  |  gasUsed 449,225  (limit clears >=5M guard; used << limit, per team note)
-  reverting client:  hard-coded 3,000,000 gas limit
-  team confirmation: needs ~>=5,000,000 gas; native-base BUY supported, fix is client-side (raise + sim at same limit)
 ```
 
 ---

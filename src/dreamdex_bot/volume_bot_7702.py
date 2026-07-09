@@ -60,7 +60,7 @@ class Settings:
     # STRICT SPREAD GATE (the "only trade when cheap" rule). Spread IS our cost, so
     # skip any book wider than this — no momentum/trend gate (atomic round-trip =
     # flat inventory, so trend is irrelevant). WBTC ~1.3bp, WETH ~2-5bp normally.
-    max_spread_bps: float = 8.0
+    max_spread_bps: float = 3.0
     cycle_interval_sec: float = 3.0
     gas_reserve_native: float = 2.0    # hard halt below this much SOMI/STT
     # Auto gas top-up: when native gas dips below the trigger (but above the hard
@@ -76,16 +76,18 @@ class Settings:
     # the real bid normally; if the bid is below the floor, we DON'T sell (keep the
     # inventory and retry) rather than realize a bad print.
     max_flatten_slippage_bps: float = 20.0
+    # Endurance mode: only trade the cheap spread regime by default. Keepalive
+    # may relax this slightly so the wallet never goes silent for 24h.
+    keepalive_max_spread_bps: float = 4.0
+    keepalive_max_clip_usdso: float = 8.0
     # Pacing: total volume is capital-bound (~$1.7M at 0.88bp on $150), so speed
     # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
     # spread it across the competition instead of blowing it in ~14h: after each
     # round-trip, wait proportionally so realized volume ≈ this per-day rate.
-    # Front-loaded: ~$300k/day reaches our ~$1.2-1.35M capital-bound ceiling in
-    # ~4-5 days, which overtakes rivals early and de-risks an early cancel (rule
-    # 10 pays on volume-to-date). Pace doesn't change the final total (capital-
-    # bound), only when we bank it. Still ~1 round-trip/40s on deep WBTC. Tune up
-    # (e.g. 500k) to reach the ceiling sooner, down to spread it out.
-    target_daily_volume_usdso: float = 300_000.0
+    # Endurance: ~$55k/day keeps the wallet active for the full two-week window
+    # instead of burning the allocation early. Pace doesn't change the capital-
+    # bound ceiling much; it decides whether we survive to the final snapshot.
+    target_daily_volume_usdso: float = 55_000.0
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
     max_round_trips: int = 10_000_000
@@ -163,7 +165,13 @@ class VolumeBot7702:
         # stdout when it isn't a TTY, which otherwise hides output for minutes.
         print(line, flush=True)
 
-    def pick_venue(self, free: float) -> tuple[Pool, float, float, float] | None:
+    def pick_venue(
+        self,
+        free: float,
+        *,
+        max_spread_bps: float | None = None,
+        keepalive: bool = False,
+    ) -> tuple[Pool, float, float, float] | None:
         """Cheapest AFFORDABLE venue: the tightest two-sided book (within
         max_spread_bps) whose minimum order we can meet with the current capital.
         Returns (pool, spread_bps, clip_usdso, min_notional) or None.
@@ -179,14 +187,19 @@ class VolumeBot7702:
             if tob.best_bid is None or tob.best_ask is None or tob.mid is None:
                 continue
             spread_bps = (tob.best_ask - tob.best_bid) / tob.mid * 10_000
-            if spread_bps > self.cfg.max_spread_bps:
+            spread_gate = self.cfg.max_spread_bps if max_spread_bps is None else max_spread_bps
+            if spread_bps > spread_gate:
                 continue  # strict spread gate: only trade when it's cheap
             # Clip = as much capital as we can, capped by the depth we can actually
             # fill at our cross limit — so the round-trip closes flat (no leftover
             # inventory) instead of walking a thin book.
             depth_cap = self.fillable_usd(p, tob.best_bid, tob.best_ask, self.cfg.cross_bps) * self.cfg.depth_fraction
-            clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             min_notional = p.min_qty * tob.best_ask
+            if keepalive:
+                target = max(min_notional * 1.05, 2.0)
+                clip = min(self.cfg.keepalive_max_clip_usdso, free * 0.10, depth_cap, target)
+            else:
+                clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             if clip < min_notional:
                 continue  # can't meet this pair's minimum with current capital/depth
             if best is None or spread_bps < best[1]:
@@ -240,7 +253,7 @@ class VolumeBot7702:
         venue = self.pick_venue(free)
         if venue is None:
             self.stats.skips += 1
-            self._maybe_keepalive()
+            self._maybe_keepalive(free)
             self.emit("skip", reason="no_affordable_venue", free=round(free, 4))
             return
         pool, spread_bps, clip, min_notional = venue
@@ -341,11 +354,50 @@ class VolumeBot7702:
             except Exception as e:
                 self.emit("flatten_failed", symbol=sym, error=str(e)[:200])
 
-    def _maybe_keepalive(self) -> None:
+    def _maybe_keepalive(self, free: float) -> None:
         idle_h = (time.time() - self.stats.last_fill_ts) / 3600
-        if idle_h >= self.cfg.keepalive_hours:
+        if idle_h < self.cfg.keepalive_hours:
+            return
+
+        venue = self.pick_venue(
+            free,
+            max_spread_bps=self.cfg.keepalive_max_spread_bps,
+            keepalive=True,
+        )
+        if venue is None:
             self.emit("keepalive_warn", idle_h=round(idle_h, 2),
-                      note="no two-sided venue while approaching 24h DQ window")
+                      note="no affordable keepalive venue while approaching 24h DQ window")
+            return
+
+        pool, spread_bps, clip, min_notional = venue
+        plan = rt.plan_round_trip(pool, size_usdso=clip, cross_bps=self.cfg.cross_bps)
+        if plan is None:
+            self.emit("keepalive_skip", symbol=pool.symbol, reason="no_plan",
+                      spread_bps=round(spread_bps, 2), clip=round(clip, 4))
+            return
+
+        res = rt.send_round_trip(
+            self.ctx, self.nm, self.impl, plan,
+            gas=self.cfg.round_trip_gas, dry_run=not self.broadcast,
+            base_decimals=pool.base_decimals, quote_decimals=pool.quote_decimals,
+        )
+        self.stats.round_trips += 1
+        if res.dry_run:
+            self.emit("keepalive_dry", symbol=pool.symbol, spread_bps=round(spread_bps, 2),
+                      notional=round(plan.notional_usdso, 2), qty=plan.qty)
+            return
+
+        self.stats.gas_used += res.gas_used
+        if res.status == 1 and res.logs > 0:
+            self.stats.fills_ok += 1
+            self.stats.volume_usdso += res.volume_usdso
+            self.stats.last_fill_ts = time.time()
+            self.emit("keepalive_ok", symbol=pool.symbol, spread_bps=round(spread_bps, 2),
+                      volume=round(res.volume_usdso, 2), gas_used=res.gas_used,
+                      cum_volume=round(self.stats.volume_usdso, 2), tx=res.tx_hash)
+        else:
+            self.emit("keepalive_bad", symbol=pool.symbol, status=res.status,
+                      logs=res.logs, tx=res.tx_hash)
 
     def _summary(self) -> dict:
         dur = time.time() - self.stats.started
@@ -365,6 +417,7 @@ def main() -> None:
     ap.add_argument("--minutes", type=float, default=10.0)
     ap.add_argument("--max-clip-usdso", type=float, default=Settings.max_clip_usdso)
     ap.add_argument("--cross-bps", type=float, default=Settings.cross_bps)
+    ap.add_argument("--max-spread-bps", type=float, default=Settings.max_spread_bps)
     ap.add_argument("--cycle-sec", type=float, default=3.0)
     ap.add_argument("--target-daily", type=float, default=Settings.target_daily_volume_usdso,
                     help="paced volume/day (USDso); 0 = trade as fast as possible")
@@ -376,7 +429,8 @@ def main() -> None:
     nm = NonceManager(ctx.w3, ctx.address)
     cfg = Settings(
         max_minutes=minutes, max_clip_usdso=args.max_clip_usdso,
-        cross_bps=args.cross_bps, cycle_interval_sec=args.cycle_sec,
+        cross_bps=args.cross_bps, max_spread_bps=args.max_spread_bps,
+        cycle_interval_sec=args.cycle_sec,
         target_daily_volume_usdso=args.target_daily,
     )
 
