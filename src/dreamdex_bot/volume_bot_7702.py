@@ -410,6 +410,35 @@ class VolumeBot7702:
         }
 
 
+def _harden_rpc(ctx) -> None:
+    """Make the RPC transport survive dropped idle connections. Somnia's RPC closes
+    idle keep-alive sockets, so the first call after a paced sleep often hits
+    'Connection reset by peer'. Mount a retry adapter that transparently reconnects
+    and re-issues, so a reset costs a quick retry instead of a whole failed tick
+    (and the occasional reverted tx that followed one). Safe on POST: JSON-RPC
+    reads are idempotent, and re-sending a signed tx is idempotent (same hash)."""
+    import requests
+    from requests.adapters import HTTPAdapter
+    try:
+        from urllib3.util.retry import Retry
+    except Exception:  # pragma: no cover
+        from urllib3.util import Retry  # type: ignore
+
+    retry = Retry(
+        total=4, connect=4, read=3, backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=None,  # retry POST too (see docstring)
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    ctx.w3.provider = Web3.HTTPProvider(
+        ctx.net.rpc_url, session=session, request_kwargs={"timeout": 30}
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     # Runtime: prefer --days for the real competition run; --minutes for short tests.
@@ -426,6 +455,7 @@ def main() -> None:
 
     minutes = args.days * 1440 if args.days is not None else args.minutes
     ctx = create_chain_context()
+    _harden_rpc(ctx)  # survive dropped idle RPC connections
     nm = NonceManager(ctx.w3, ctx.address)
     cfg = Settings(
         max_minutes=minutes, max_clip_usdso=args.max_clip_usdso,
