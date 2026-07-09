@@ -84,10 +84,13 @@ class Settings:
     # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
     # spread it across the competition instead of blowing it in ~14h: after each
     # round-trip, wait proportionally so realized volume ≈ this per-day rate.
-    # Endurance: ~$55k/day keeps the wallet active for the full two-week window
-    # instead of burning the allocation early. Pace doesn't change the capital-
-    # bound ceiling much; it decides whether we survive to the final snapshot.
-    target_daily_volume_usdso: float = 55_000.0
+    # Steady spend: ~$90k/day spends the full $150 (reaching the ~$1.06M capital-
+    # bound ceiling) by ~day 12, leaving a 1-2 day buffer against an early cancel,
+    # while the strict spread gate keeps every trade cheap. Pace doesn't change the
+    # ceiling — only whether we actually reach it (too slow leaves capital unspent)
+    # — so this is the "protect the spread AND don't undershoot" middle. The
+    # keepalive covers the 24h-DQ rule in the tail once clips shrink.
+    target_daily_volume_usdso: float = 90_000.0
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
     max_round_trips: int = 10_000_000
