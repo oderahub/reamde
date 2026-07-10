@@ -54,7 +54,12 @@ class Settings:
     # true limits. WBTC's book is deep (~$40k within 10bp), so on $150 a clip is
     # capital-bound (~$135), not depth-bound.
     max_clip_usdso: float = 500.0
-    balance_fraction: float = 0.90     # fraction of free USDso a clip may use
+    balance_fraction: float = 0.95     # fraction of free USDso a clip may use
+    # Prefer this venue by this bps margin: WBTC is deep + always tight + big-clip,
+    # so route there unless another pair is cheaper by more than the bias (WETH's
+    # tiny clips cost the same gas for ~4x less volume).
+    preferred_symbol: str = "WBTC:USDso"
+    preferred_bias_bps: float = 1.5
     depth_fraction: float = 0.50       # never clip more than this share of the depth fillable at our cross limit
     cross_bps: float = 5.0             # cross each touch by this much so both legs fill
     # STRICT SPREAD GATE (the "only trade when cheap" rule). Spread IS our cost, so
@@ -89,13 +94,12 @@ class Settings:
     # doesn't raise the ceiling — it just decides how fast we spend the fuel. We
     # spread it across the competition instead of blowing it in ~14h: after each
     # round-trip, wait proportionally so realized volume ≈ this per-day rate.
-    # Steady spend: ~$90k/day spends the full $150 (reaching the ~$1.06M capital-
-    # bound ceiling) by ~day 12, leaving a 1-2 day buffer against an early cancel,
-    # while the strict spread gate keeps every trade cheap. Pace doesn't change the
-    # ceiling — only whether we actually reach it (too slow leaves capital unspent)
-    # — so this is the "protect the spread AND don't undershoot" middle. The
-    # keepalive covers the 24h-DQ rule in the tail once clips shrink.
-    target_daily_volume_usdso: float = 90_000.0
+    # Fast spend: ~$200k/day banks the full ~$1.11M capital-bound ceiling in ~5-6
+    # days, which de-risks an early cancel (rule 10) and closes the pace gap to the
+    # leaders. This is safe because WBTC sits inside the 3bp gate ~100% of the time
+    # (measured) — so trading MORE often stays just as cheap; pace up ≠ cost up. The
+    # gate still protects every trade; the keepalive covers the 24h-DQ tail.
+    target_daily_volume_usdso: float = 200_000.0
     round_trip_gas: int = rt.DEFAULT_ROUND_TRIP_GAS
     max_minutes: float = 10.0
     max_round_trips: int = 10_000_000
@@ -210,9 +214,13 @@ class VolumeBot7702:
                 clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             if clip < min_notional:
                 continue  # can't meet this pair's minimum with current capital/depth
-            if best is None or spread_bps < best[1]:
-                best = (p, spread_bps, clip, min_notional)
-        return best
+            # Bias to the preferred venue (WBTC): it's deep, always tight, and gives
+            # big clips (WETH's tiny clips burn the same gas for ~4x less volume). We
+            # only switch to another pair when it's cheaper by MORE than the bias.
+            score = spread_bps - (self.cfg.preferred_bias_bps if sym == self.cfg.preferred_symbol else 0.0)
+            if best is None or score < best[0]:
+                best = (score, p, spread_bps, clip, min_notional)
+        return (best[1], best[2], best[3], best[4]) if best else None
 
     # ---- main loop ---------------------------------------------------------
     def run(self) -> None:
