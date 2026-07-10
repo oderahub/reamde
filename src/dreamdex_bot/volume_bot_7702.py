@@ -76,6 +76,11 @@ class Settings:
     # the real bid normally; if the bid is below the floor, we DON'T sell (keep the
     # inventory and retry) rather than realize a bad print.
     max_flatten_slippage_bps: float = 20.0
+    # Keep the wallet flat automatically: sweep residual/dust every this often (not
+    # just on boot, so nothing accumulates between restarts), and recover
+    # sub-minimum dust down to this value (below it the gas isn't worth it).
+    flatten_interval_sec: float = 1800.0
+    dust_recover_min_usd: float = 0.50
     # Endurance mode: only trade the cheap spread regime by default. Keepalive
     # may relax this slightly so the wallet never goes silent for 24h.
     keepalive_max_spread_bps: float = 4.0
@@ -216,6 +221,7 @@ class VolumeBot7702:
                   settings=asdict(self.cfg))
         if self.broadcast:
             self._flatten_residual_base()  # start flat — clear any stranded inventory
+        last_flatten = time.time()
         deadline = self.stats.started + self.cfg.max_minutes * 60
         while time.time() < deadline and self.stats.round_trips < self.cfg.max_round_trips:
             vol_before = self.stats.volume_usdso
@@ -225,6 +231,10 @@ class VolumeBot7702:
                 self.emit("tick_error", error=str(e)[:200])
                 self.nm.reset()
                 time.sleep(2.0)
+            # Periodic sweep so residual/dust can't build up between restarts.
+            if self.broadcast and time.time() - last_flatten >= self.cfg.flatten_interval_sec:
+                self._flatten_residual_base()
+                last_flatten = time.time()
             self._pace_sleep(self.stats.volume_usdso - vol_before)
         self.emit("stop", **self._summary())
 
@@ -321,19 +331,29 @@ class VolumeBot7702:
             self.emit("gas_topup_failed", error=str(e)[:200])
 
     def _flatten_residual_base(self) -> None:
-        """Sell any leftover base inventory (IOC) so we start flat — but NEVER at a
-        bad price. The sell limit is floored at mid*(1-max_flatten_slippage_bps):
-        it fills at the real bid in a healthy book, and if the bid has dropped below
-        that floor (thin/dislocated book) we defer rather than dump — keeping the
-        inventory to retry on a later boot/tick. Uses the loop's own NonceManager so
-        it can't collide with round-trip nonces. Skips dust (< ~$1)."""
+        """Keep the wallet flat. For each pair, sell any leftover base (IOC) at a
+        price floored at mid*(1-max_flatten_slippage_bps) — fills at the real bid in
+        a healthy book, defers (keeps it) if the bid has dropped below the floor.
+
+        Sub-minimum DUST (0 < base < minQuantity, so it can't be sold directly) is
+        recovered by first BUYING up to the minimum, then selling the whole lot —
+        nets the dust back minus the spread. Uses the loop's own NonceManager so it
+        can't collide with round-trip nonces. Leaves only true crumbs
+        (< dust_recover_min_usd)."""
         for sym in CANDIDATE_SYMBOLS:
             try:
                 p = self._pool(sym)
-                base = p.wallet_base()
                 tob = p.top_of_book()
-                if tob.best_bid is None or tob.mid is None or base * tob.best_bid < 1.0:
+                if tob.best_bid is None or tob.mid is None:
                     continue
+                base = p.wallet_base()
+                if base * tob.best_bid < self.cfg.dust_recover_min_usd:
+                    continue  # nothing worth clearing
+                # Dust recovery: below min tradable -> buy a full min-lot so the
+                # total clears the minimum, then fall through to sell everything.
+                if base < from_raw(p.params.min_quantity, p.base_decimals):
+                    self._buy_to_min(p, tob)
+                    base = p.wallet_base()  # re-read after the top-up buy
                 floor = tob.mid * (1 - self.cfg.max_flatten_slippage_bps / 10_000)
                 if tob.best_bid < floor:
                     self.emit("flatten_deferred", symbol=sym, reason="bid_below_floor",
@@ -345,7 +365,7 @@ class VolumeBot7702:
                 price_raw = align_to_tick(to_raw(floor, p.quote_decimals), p.params.tick_size, "bid")
                 qty_raw = align_to_lot(to_raw(base, p.base_decimals), p.params.lot_size)
                 if qty_raw < p.params.min_quantity:
-                    continue
+                    continue  # still below min (top-up didn't fill) — retry next sweep
                 res = place_order(self.ctx, self.nm, PlaceParams(
                     pool=p.address, base_is_native=p.base_is_native, is_bid=False,
                     price_raw=price_raw, quantity_raw=qty_raw, tick_raw=p.params.tick_size,
@@ -356,6 +376,23 @@ class VolumeBot7702:
                           usd=round(base * tob.best_bid, 2), floor=round(floor, 4), tx=res.tx_hash)
             except Exception as e:
                 self.emit("flatten_failed", symbol=sym, error=str(e)[:200])
+
+    def _buy_to_min(self, p: Pool, tob) -> None:
+        """Buy one full minQuantity lot (IOC at the ask) so a sub-minimum dust
+        balance clears the minimum and becomes sellable."""
+        price_raw = align_to_tick(
+            to_raw(tob.best_ask * (1 + self.cfg.cross_bps / 10_000), p.quote_decimals),
+            p.params.tick_size, "ask",
+        )
+        res = place_order(self.ctx, self.nm, PlaceParams(
+            pool=p.address, base_is_native=p.base_is_native, is_bid=True,
+            price_raw=price_raw, quantity_raw=p.params.min_quantity,
+            tick_raw=p.params.tick_size, lot_raw=p.params.lot_size,
+            min_qty_raw=p.params.min_quantity, expire_ns=build_expire_ns(5 * 60_000),
+            order_type=OrderType.IOC,
+        ))
+        self.emit("dust_topup", symbol=p.symbol,
+                  bought=from_raw(p.params.min_quantity, p.base_decimals), tx=res.tx_hash)
 
     def _maybe_keepalive(self, free: float) -> None:
         idle_h = (time.time() - self.stats.last_fill_ts) / 3600
