@@ -48,16 +48,18 @@ CANDIDATE_SYMBOLS = ["WBTC:USDso", "WETH:USDso"]
 
 @dataclass
 class Settings:
-    # Sizing. Counter-intuitively NOT "as large as possible": a live clip-size sweep
-    # (12 samples x both books, net = book-walk + our fixed 2.5M-gas round-trip
-    # amortized over the clip) found a U-shaped net cost-per-volume with the minimum
-    # at ~$40-50. Above ~$65 the book-walk dominates (thin touch); below ~$30 our
-    # heavy atomic-tx gas dominates. $80 clips cost ~0.5bp/vol MORE than $50. Capping
-    # here at $50 (the sweet spot) trades ~1.6x more round-trips for ~0.5bp better
-    # efficiency, lifting our capital-bound ceiling ~$1.25M -> ~$1.6M. This is why
-    # trader-3 (~$30 clips) out-efficiencies us; our optimum sits above theirs
-    # because our atomic round-trip is gas-heavier than their single-leg orders.
-    max_clip_usdso: float = 50.0
+    # Sizing. Gas is the real cap (~4.1k round-trips per 50 SOMI on mainnet), so
+    # each round-trip should be as LARGE as capital + book depth allow — more
+    # volume per gas-tx. max_clip is a high ceiling; capital and live depth are the
+    # true limits. WBTC's book is deep, so on $150 a clip is capital-bound (~$80),
+    # not depth-bound.
+    #
+    # NB: a $50 cap was TESTED (a book-walk sweep modeled ~0.5bp better efficiency
+    # from smaller clips) and REVERTED. Live measurement over 85min showed 1.27bp
+    # vs the proven 1.24bp — no gain — because the effective-cost gate already skims
+    # the cheapest fills, and ~2x the round-trips added ~0.06bp of gas. Don't re-try
+    # small clips without also modeling the gate-filtering and gas overhead.
+    max_clip_usdso: float = 500.0
     balance_fraction: float = 0.95     # fraction of free USDso a clip may use
     # Prefer this venue by this bps margin: WBTC is deep + always tight + big-clip,
     # so route there unless another pair is cheaper by more than the bias (WETH's
