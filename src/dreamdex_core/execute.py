@@ -24,7 +24,15 @@ from .gotchas import (
 )
 from .nonce import NonceManager
 
-NATIVE_BASE_BUY_GAS = 5_000_000
+# Native-SOMI buys run a payout gas-headroom guard (revert 0x782b2567). The 5M
+# minimum in the docs is the gasLeft required AT the payout point, so the broadcast
+# LIMIT must be higher (some gas is consumed before payout). CRITICAL: place_order
+# simulates via eth_call, which runs with ~unlimited gas, so the guard ALWAYS
+# passes in simulation — the broadcast gas LIMIT is the only real protection. Set
+# the floor ABOVE the only limit we've ever confirmed on-chain (8.62M) to 10M so we
+# have proven headroom, not an estimate. Gas is a limit (refunded if unused): 10M
+# costs nothing extra but removes the "is it enough" doubt on the auto top-up.
+NATIVE_BASE_BUY_GAS = 10_000_000
 DEFAULT_GAS = 700_000
 
 

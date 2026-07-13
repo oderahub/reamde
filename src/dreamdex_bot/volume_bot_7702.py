@@ -65,16 +65,32 @@ class Settings:
     # STRICT SPREAD GATE (the "only trade when cheap" rule). Spread IS our cost, so
     # skip any book wider than this — no momentum/trend gate (atomic round-trip =
     # flat inventory, so trend is irrelevant). WBTC ~1.3bp, WETH ~2-5bp normally.
-    max_spread_bps: float = 3.0
+    # This is only a cheap PRE-FILTER on the QUOTED spread; the real gate below is
+    # size-aware. Tightened 3.0 -> 2.5.
+    max_spread_bps: float = 2.5
+    # EFFECTIVE-COST GATE (the substantive fix). Quoted spread understates cost when
+    # the touch is hollow: a book can quote <2.5bp yet cost 4+bp after our clip walks
+    # it (bid-side touch collapsed to ~$23 during the July wide-market stretch). So
+    # gate on the VWAP round-trip cost for the ACTUAL clip: buy_slip+sell_slip vs mid.
+    # rt_cost/2 == realized cost-per-volume, so 2.6bp here == ~1.3bp/vol == our
+    # lifetime efficiency. We only trade when we can roughly match our own edge;
+    # during a widened market we skip and preserve capital (which raises the ceiling).
+    max_rt_cost_bps: float = 2.6
     cycle_interval_sec: float = 3.0
-    gas_reserve_native: float = 2.0    # hard halt below this much SOMI/STT
-    # Auto gas top-up: when native gas dips below the trigger (but above the hard
-    # reserve), spend a little USDso on SOMI to keep trading. Rule 6 allows this and
-    # it's cheap (~$6/50 SOMI) relative to the volume it unlocks. Mainnet-relevant;
-    # dormant on testnet (native there is STT, and the reserve is ample).
+    # Hard halt below this much SOMI/STT. Gas is CHEAP on Somnia (~6 gwei → a
+    # round-trip is ~0.012 SOMI, a native buy ~0.048 SOMI at 8M gas), so this floor
+    # only needs to cover a handful of txs incl. one self-rescue top-up even if gas
+    # spikes ~5x. The old 2.0 was ~160 round-trips of usable gas held hostage — it
+    # stranded the bot at 1.99 SOMI (halt fired before the top-up could refuel).
+    gas_reserve_native: float = 0.3
+    # Auto gas top-up: when native gas dips below the trigger, spend a little USDso
+    # on SOMI to keep trading. Rule 6 allows it. SOMI ~$0.10, so $2 buys ~20 SOMI ≈
+    # 1600 round-trips of runway — and SOMI is a sellable asset, so this parks (not
+    # burns) capital. Kept small so nearly all $150 stays as USDso for clips.
+    # Mainnet-relevant; dormant on testnet (native there is STT, reserve is ample).
     gas_topup_enabled: bool = True
-    gas_topup_trigger_native: float = 6.0
-    gas_topup_spend_usdso: float = 3.0
+    gas_topup_trigger_native: float = 1.0
+    gas_topup_spend_usdso: float = 2.0
     keepalive_hours: float = 20.0      # force a min trade if idle longer than this
     # Flatten price protection: when selling leftover base, floor the sell at
     # mid*(1-this) so we never dump into a thin/dislocated book. It still fills at
@@ -168,6 +184,31 @@ class VolumeBot7702:
                 bid_usd += price * from_raw(size_raw, pool.base_decimals)
         return min(ask_usd, bid_usd)
 
+    def effective_rt_cost_bps(self, pool: Pool, clip: float, mid: float) -> float | None:
+        """VWAP cost, in bps of mid, to BUY `clip` USDso on the asks and SELL `clip`
+        on the bids — i.e. what a round-trip of this size actually pays after walking
+        the book, not the quoted touch. Returns buy_slip + sell_slip (rt_cost), or
+        None if either side lacks the depth to fill the clip. rt_cost/2 is the
+        cost-per-volume this clip would realize."""
+        def vwap(levels, notional: float) -> float | None:
+            rem, base = notional, 0.0
+            for price_raw, size_raw in levels:
+                price = from_raw(price_raw, pool.quote_decimals)
+                lvl_usd = price * from_raw(size_raw, pool.base_decimals)
+                take = min(lvl_usd, rem)
+                base += take / price      # base units bought/sold at this level
+                rem -= take
+                if rem <= 1e-9:
+                    break
+            if rem > 1e-9 or base <= 0:
+                return None               # not enough depth to fill the whole clip
+            return notional / base        # notional-weighted average price
+        buy_vwap = vwap(read_book_levels(pool._contract, False, 15), clip)   # asks
+        sell_vwap = vwap(read_book_levels(pool._contract, True, 15), clip)   # bids
+        if buy_vwap is None or sell_vwap is None or mid <= 0:
+            return None
+        return (buy_vwap - mid) / mid * 1e4 + (mid - sell_vwap) / mid * 1e4
+
     def emit(self, event: str, **kw) -> None:
         rec = {"ts": round(time.time(), 3), "event": event, **kw}
         line = json.dumps(rec)
@@ -214,10 +255,19 @@ class VolumeBot7702:
                 clip = min(self.cfg.max_clip_usdso, free * self.cfg.balance_fraction, depth_cap)
             if clip < min_notional:
                 continue  # can't meet this pair's minimum with current capital/depth
-            # Bias to the preferred venue (WBTC): it's deep, always tight, and gives
-            # big clips (WETH's tiny clips burn the same gas for ~4x less volume). We
-            # only switch to another pair when it's cheaper by MORE than the bias.
-            score = spread_bps - (self.cfg.preferred_bias_bps if sym == self.cfg.preferred_symbol else 0.0)
+            # SIZE-AWARE COST GATE: what this clip actually pays after walking the
+            # book. A book can pass the quoted-spread pre-filter while the hollow-
+            # touch effective cost is ~2x higher — that's the capital-burn we're
+            # closing. Skip (preserve capital) unless we can trade near our own edge.
+            # Bypassed on keepalive so we can still force a trade to dodge 24h-DQ.
+            rt_cost = self.effective_rt_cost_bps(p, clip, tob.mid)
+            if not keepalive and (rt_cost is None or rt_cost > self.cfg.max_rt_cost_bps):
+                continue
+            # Bias to the preferred venue (WBTC): deep, always tight, big clips (WETH's
+            # tiny clips burn the same gas for ~4x less volume). Score on the EFFECTIVE
+            # cost we'd actually pay (fall back to quoted spread if depth is unknown).
+            eff = rt_cost if rt_cost is not None else spread_bps
+            score = eff - (self.cfg.preferred_bias_bps if sym == self.cfg.preferred_symbol else 0.0)
             if best is None or score < best[0]:
                 best = (score, p, spread_bps, clip, min_notional)
         return (best[1], best[2], best[3], best[4]) if best else None
@@ -258,15 +308,20 @@ class VolumeBot7702:
         time.sleep(max(base, pace))
 
     def _tick(self) -> None:
-        # 1. Gas guard, then auto top-up if dipping (buys more runway with a little
-        #    USDso — rule 6 allows it and it's cheap vs the volume it unlocks).
+        # 1. Gas guard. Try the top-up FIRST when dipping so a low-but-usable balance
+        #    self-rescues (buys runway with a little USDso — rule 6 allows it, cheap
+        #    vs the volume it unlocks), then re-read and only hard-halt if still under
+        #    reserve. Ordering matters: halting before the top-up is what stranded us
+        #    at 1.99 SOMI with plenty of usable gas. place_order simulates before
+        #    broadcast, so a guaranteed-revert top-up won't even burn gas.
         gas = self.native_gas()
+        if self.cfg.gas_topup_enabled and self.broadcast and gas < self.cfg.gas_topup_trigger_native:
+            self._topup_gas()
+            gas = self.native_gas()  # the top-up may have just refueled us
         if gas < self.cfg.gas_reserve_native:
             self.emit("halt_low_gas", gas=gas, reserve=self.cfg.gas_reserve_native)
             time.sleep(10)
             return
-        if self.cfg.gas_topup_enabled and self.broadcast and gas < self.cfg.gas_topup_trigger_native:
-            self._topup_gas()
 
         # 2. Burn-to-floor sizing: pick the cheapest venue we can afford, and use
         #    most of the (near-flat) capital on it. USDso is the shared quote.
