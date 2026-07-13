@@ -132,14 +132,27 @@ def cancel_order(ctx: ChainContext, nm: NonceManager, pool_addr: str, order_id: 
 
 def ensure_allowance(ctx: ChainContext, nm: NonceManager, token: str, spender: str, amount: int) -> None:
     erc = ctx.w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
-    current = erc.functions.allowance(ctx.address, Web3.to_checksum_address(spender)).call()
+    spender = Web3.to_checksum_address(spender)
+    current = erc.functions.allowance(ctx.address, spender).call()
     if current >= amount:
         return
-    tx = erc.functions.approve(Web3.to_checksum_address(spender), amount * 8).build_transaction({
-        "from": ctx.address, "nonce": nm.reserve(), "gas": DEFAULT_GAS,
+    fn = erc.functions.approve(spender, amount * 8)
+    # A plain approve from a 7702-delegated wallet is gas-heavy: estimate_gas reports
+    # ~1.4M here, so the old fixed 700k floor silently ran the approve OUT OF GAS ->
+    # allowance stayed 0 -> every native gas top-up reverted with the
+    # 0xfb8f41b2 ERC20InsufficientAllowance selector. Estimate for real with a floor,
+    # and verify the approve actually mined so we don't proceed on a false success.
+    try:
+        gas = max(int(fn.estimate_gas({"from": ctx.address}) * 1.3), DEFAULT_GAS)
+    except Exception:
+        gas = 2_000_000
+    tx = fn.build_transaction({
+        "from": ctx.address, "nonce": nm.reserve(), "gas": gas,
         "chainId": ctx.net.chain_id, **nm.gas_fields(),
     })
-    _sign_send_wait(ctx, nm, tx)
+    receipt = _sign_send_wait(ctx, nm, tx)
+    if receipt["status"] != 1:
+        raise GotchaError("APPROVE_REVERTED", f"approve tx reverted: {receipt['transactionHash'].hex()}")
 
 
 def _pick_gas(ctx: ChainContext, pool, args, value: int, base_is_native: bool, is_bid: bool) -> int:

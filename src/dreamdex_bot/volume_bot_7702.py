@@ -100,7 +100,10 @@ class Settings:
     # Keep the wallet flat automatically: sweep residual/dust every this often (not
     # just on boot, so nothing accumulates between restarts), and recover
     # sub-minimum dust down to this value (below it the gas isn't worth it).
-    flatten_interval_sec: float = 1800.0
+    # 30min was too slow: sell legs under-fill in the hollow bid touch, so WBTC
+    # residual rebuilt to ~$45 (half our capital) between sweeps and clips halved.
+    # 5min caps stuck inventory at a few $ so full-size clips keep running.
+    flatten_interval_sec: float = 300.0
     dust_recover_min_usd: float = 0.50
     # Endurance mode: only trade the cheap spread regime by default. Keepalive
     # may relax this slightly so the wallet never goes silent for 24h.
